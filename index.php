@@ -10,7 +10,8 @@ session_start();
 
 $config = require __DIR__ . '/config.php';
 $error = '';
-$notice = '';
+$notice = (string)($_SESSION['flash_notice'] ?? '');
+unset($_SESSION['flash_notice']);
 $db = null;
 
 function h(string $value): string
@@ -26,6 +27,20 @@ function database(array $config): PDO
         $config['db_password'],
         [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION, PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC]
     );
+}
+
+function storageDirectory(array $config, bool $create = false): string
+{
+    $configuredPath = $config['storage_path'];
+    if ($create && !is_dir($configuredPath) && !mkdir($configuredPath, 0700, true) && !is_dir($configuredPath)) {
+        throw new RuntimeException('Güvenli dosya alanı oluşturulamadı.');
+    }
+    $storagePath = realpath($configuredPath);
+    $applicationPath = realpath(__DIR__);
+    if ($storagePath === false || $applicationPath === false || $storagePath === $applicationPath || str_starts_with($storagePath, $applicationPath . DIRECTORY_SEPARATOR)) {
+        throw new RuntimeException('Dosya alanı uygulama/web kök dizininin dışında olmalıdır.');
+    }
+    return $storagePath;
 }
 
 function can(string $permission): bool
@@ -72,6 +87,19 @@ try {
     $error = 'Veritabanına bağlanılamadı. README dosyasındaki kurulum adımlarını ve veritabanı ayarlarını kontrol edin.';
 }
 
+if ($db instanceof PDO && isset($_SESSION['user'])) {
+    $statement = $db->prepare('SELECT * FROM users WHERE id = ?');
+    $statement->execute([(int)$_SESSION['user']['id']]);
+    $currentUser = $statement->fetch();
+    if (!$currentUser) {
+        unset($_SESSION['user']);
+        session_regenerate_id(true);
+    } else {
+        unset($currentUser['password_hash']);
+        $_SESSION['user'] = $currentUser;
+    }
+}
+
 if ($db instanceof PDO && isset($_GET['download'], $_SESSION['user'])) {
     try {
         $statement = $db->prepare('SELECT original_name, storage_name FROM files WHERE id = ?');
@@ -81,7 +109,7 @@ if ($db instanceof PDO && isset($_GET['download'], $_SESSION['user'])) {
             http_response_code(404);
             exit('Dosya bulunamadı.');
         }
-        $path = $config['storage_path'] . DIRECTORY_SEPARATOR . $file['storage_name'];
+        $path = storageDirectory($config) . DIRECTORY_SEPARATOR . $file['storage_name'];
         if (!is_file($path)) {
             http_response_code(404);
             exit('Dosya diskte bulunamadı.');
@@ -106,13 +134,23 @@ if ($db instanceof PDO && $_SERVER['REQUEST_METHOD'] === 'POST') {
         $action = (string)($_POST['action'] ?? '');
 
         if ($action === 'setup' && $userCount === 0) {
-            $username = trim((string)($_POST['username'] ?? ''));
-            $password = (string)($_POST['password'] ?? '');
-            if (!preg_match('/^[\pL\pN_.-]{3,80}$/u', $username) || strlen($password) < 12) {
-                throw new RuntimeException('Kullanıcı adı 3-80 karakter olmalı; parola en az 12 karakter olmalıdır.');
+            if ((int)$db->query("SELECT GET_LOCK('local_host_file_share_owner_setup', 10)")->fetchColumn() !== 1) {
+                throw new RuntimeException('Ana hesap kurulumu için kilit alınamadı. Tekrar deneyin.');
             }
-            $statement = $db->prepare('INSERT INTO users (username, password_hash, is_owner) VALUES (?, ?, 1)');
-            $statement->execute([$username, password_hash($password, PASSWORD_DEFAULT)]);
+            try {
+                if ((int)$db->query('SELECT COUNT(*) FROM users')->fetchColumn() !== 0) {
+                    throw new RuntimeException('Ana kullanıcı hesabı zaten oluşturulmuş. Oturum açın.');
+                }
+                $username = trim((string)($_POST['username'] ?? ''));
+                $password = (string)($_POST['password'] ?? '');
+                if (!preg_match('/^[\pL\pN_.-]{3,80}$/u', $username) || strlen($password) < 12) {
+                    throw new RuntimeException('Kullanıcı adı 3-80 karakter olmalı; parola en az 12 karakter olmalıdır.');
+                }
+                $statement = $db->prepare('INSERT INTO users (username, password_hash, is_owner) VALUES (?, ?, 1)');
+                $statement->execute([$username, password_hash($password, PASSWORD_DEFAULT)]);
+            } finally {
+                $db->query("SELECT RELEASE_LOCK('local_host_file_share_owner_setup')");
+            }
             session_regenerate_id(true);
             $_SESSION['user'] = ['id' => (int)$db->lastInsertId(), 'username' => $username, 'is_owner' => 1];
             redirectHome();
@@ -154,11 +192,9 @@ if ($db instanceof PDO && $_SERVER['REQUEST_METHOD'] === 'POST') {
             if ($name === '' || strlen($name) > 255 || str_contains($name, "\0")) {
                 throw new RuntimeException('Dosya adı geçersiz veya çok uzun.');
             }
-            if (!is_dir($config['storage_path']) && !mkdir($config['storage_path'], 0700, true) && !is_dir($config['storage_path'])) {
-                throw new RuntimeException('Güvenli dosya alanı oluşturulamadı.');
-            }
+            $storageDirectory = storageDirectory($config, true);
             $storageName = bin2hex(random_bytes(32));
-            $destination = $config['storage_path'] . DIRECTORY_SEPARATOR . $storageName;
+            $destination = $storageDirectory . DIRECTORY_SEPARATOR . $storageName;
             if (!move_uploaded_file($upload['tmp_name'], $destination)) {
                 throw new RuntimeException('Dosya güvenli alana taşınamadı.');
             }
@@ -178,8 +214,9 @@ if ($db instanceof PDO && $_SERVER['REQUEST_METHOD'] === 'POST') {
             if (!$file) {
                 throw new RuntimeException('Dosya bulunamadı.');
             }
+            $path = storageDirectory($config) . DIRECTORY_SEPARATOR . $file['storage_name'];
             $db->prepare('DELETE FROM files WHERE id = ?')->execute([(int)$_POST['file_id']]);
-            @unlink($config['storage_path'] . DIRECTORY_SEPARATOR . $file['storage_name']);
+            @unlink($path);
             $notice = 'Dosya silindi.';
         } elseif ($action === 'save_text') {
             requirePermission('can_edit');
@@ -194,7 +231,7 @@ if ($db instanceof PDO && $_SERVER['REQUEST_METHOD'] === 'POST') {
             if (strlen($content) > $config['max_edit_bytes']) {
                 throw new RuntimeException('Düzenlenebilir dosyalar en fazla 2 MB olabilir.');
             }
-            $path = $config['storage_path'] . DIRECTORY_SEPARATOR . $file['storage_name'];
+            $path = storageDirectory($config) . DIRECTORY_SEPARATOR . $file['storage_name'];
             if (file_put_contents($path, $content, LOCK_EX) === false) {
                 throw new RuntimeException('Dosya kaydedilemedi.');
             }
@@ -212,11 +249,9 @@ if ($db instanceof PDO && $_SERVER['REQUEST_METHOD'] === 'POST') {
             if (strlen($content) > $config['max_edit_bytes']) {
                 throw new RuntimeException('Not en fazla 2 MB olabilir.');
             }
-            if (!is_dir($config['storage_path']) && !mkdir($config['storage_path'], 0700, true) && !is_dir($config['storage_path'])) {
-                throw new RuntimeException('Güvenli dosya alanı oluşturulamadı.');
-            }
+            $storageDirectory = storageDirectory($config, true);
             $storageName = bin2hex(random_bytes(32));
-            $path = $config['storage_path'] . DIRECTORY_SEPARATOR . $storageName;
+            $path = $storageDirectory . DIRECTORY_SEPARATOR . $storageName;
             if (file_put_contents($path, $content, LOCK_EX) === false) {
                 throw new RuntimeException('Not oluşturulamadı.');
             }
@@ -260,32 +295,65 @@ if ($db instanceof PDO && $_SERVER['REQUEST_METHOD'] === 'POST') {
                 throw new RuntimeException('Kullanıcı bulunamadı veya ana kullanıcı silinemez.');
             }
             $notice = 'Kullanıcı hesabı silindi.';
-        } elseif (!in_array($action, ['upload', 'delete_file', 'save_text', 'create_note', 'create_user', 'delete_user'], true)) {
+        } elseif ($action === 'update_user') {
+            requirePermission('can_manage_users');
+            $id = (int)($_POST['user_id'] ?? 0);
+            $statement = $db->prepare(
+                'UPDATE users SET can_manage_users = ?, can_upload = ?, can_edit = ?, can_delete = ?
+                 WHERE id = ? AND is_owner = 0'
+            );
+            $statement->execute([
+                isset($_POST['can_manage_users']) ? 1 : 0,
+                isset($_POST['can_upload']) ? 1 : 0,
+                isset($_POST['can_edit']) ? 1 : 0,
+                isset($_POST['can_delete']) ? 1 : 0,
+                $id,
+            ]);
+            $check = $db->prepare('SELECT id FROM users WHERE id = ? AND is_owner = 0');
+            $check->execute([$id]);
+            if (!$check->fetch()) {
+                throw new RuntimeException('Kullanıcı bulunamadı veya ana kullanıcının yetkileri değiştirilemez.');
+            }
+            $notice = 'Kullanıcı yetkileri güncellendi.';
+        } elseif (!in_array($action, ['upload', 'delete_file', 'save_text', 'create_note', 'create_user', 'delete_user', 'update_user'], true)) {
             throw new RuntimeException('İstenen işlem tanınmadı.');
         }
     } catch (Throwable $exception) {
-        $error = $exception instanceof PDOException && (string)$exception->getCode() === '23000'
-            ? 'Bu kullanıcı adı zaten kullanılıyor.'
-            : $exception->getMessage();
+        $error = $exception instanceof PDOException
+            ? ((string)$exception->getCode() === '23000' ? 'Bu kullanıcı adı zaten kullanılıyor.' : 'Veritabanı işlemi tamamlanamadı.')
+            : ($exception instanceof RuntimeException ? $exception->getMessage() : 'Beklenmeyen bir hata oluştu.');
     }
+}
+
+if ($db instanceof PDO) {
+    $userCount = (int)$db->query('SELECT COUNT(*) FROM users')->fetchColumn();
+}
+if ($notice !== '') {
+    $_SESSION['flash_notice'] = $notice;
+    redirectHome();
 }
 
 $loggedIn = isset($_SESSION['user']);
 $editing = null;
 $editContent = '';
 if ($loggedIn && $db instanceof PDO && isset($_GET['edit']) && can('can_edit')) {
-    $statement = $db->prepare('SELECT id, original_name, storage_name FROM files WHERE id = ?');
-    $statement->execute([(int)$_GET['edit']]);
-    $editing = $statement->fetch();
-    if ($editing && textExtension($editing['original_name'])) {
-        $path = $config['storage_path'] . DIRECTORY_SEPARATOR . $editing['storage_name'];
-        if (is_file($path) && filesize($path) <= $config['max_edit_bytes']) {
-            $editContent = (string)file_get_contents($path);
-        } elseif (is_file($path)) {
-            $error = '2 MB üzerindeki dosyalar metin düzenleyicide açılamaz.';
+    try {
+        $statement = $db->prepare('SELECT id, original_name, storage_name FROM files WHERE id = ?');
+        $statement->execute([(int)$_GET['edit']]);
+        $editing = $statement->fetch();
+        if ($editing && textExtension($editing['original_name'])) {
+            $path = storageDirectory($config) . DIRECTORY_SEPARATOR . $editing['storage_name'];
+            if (is_file($path) && filesize($path) <= $config['max_edit_bytes']) {
+                $editContent = (string)file_get_contents($path);
+            } elseif (is_file($path)) {
+                $error = '2 MB üzerindeki dosyalar metin düzenleyicide açılamaz.';
+                $editing = null;
+            }
+        } else {
             $editing = null;
         }
-    } else {
+    } catch (Throwable $exception) {
+        $error = $exception instanceof RuntimeException ? $exception->getMessage() : 'Dosya düzenleyicide açılamadı.';
         $editing = null;
     }
 }
@@ -322,6 +390,7 @@ if ($loggedIn && $db instanceof PDO) {
 
     <?php if ($error): ?><p class="message error" role="alert"><?php echo h($error); ?></p><?php endif; ?>
     <?php if ($notice): ?><p class="message success" role="status"><?php echo h($notice); ?></p><?php endif; ?>
+    <aside class="security-warning" role="note"><strong>Güvenlik uyarısı:</strong> Bu yazılım yerel ağ kullanımı içindir; web hostingde herkese açık biçimde çalıştırılması önerilmez. Uzak erişim gerekiyorsa web kök dizininin ve dosya depolama disk/alanının şifrelenmesi, HTTPS, güçlü parolalar ve ağ erişim kısıtlamaları gerekir. Disk şifrelemesi tek başına çevrimiçi saldırılara karşı koruma sağlamaz.</aside>
 
     <?php if (!$db instanceof PDO): ?>
         <section class="card"><h2>Kurulum gerekli</h2><p>Veritabanını oluşturup <code>database.sql</code> dosyasını içe aktarın; ardından README dosyasındaki veritabanı ayarlarını yapın.</p></section>
@@ -432,7 +501,17 @@ if ($loggedIn && $db instanceof PDO) {
                         $user['can_edit'] ? 'düzenleme' : '',
                         $user['can_delete'] ? 'silme' : '',
                     ])) ?: 'Yetki yok'); ?></td><td>
-                        <?php if (!$user['is_owner']): ?><form method="post" data-confirm="Bu kullanıcı hesabı silinsin mi?"><?php echo csrfField(); ?><input type="hidden" name="action" value="delete_user"><input type="hidden" name="user_id" value="<?php echo (int)$user['id']; ?>"><button class="button small danger">Hesabı sil</button></form><?php endif; ?>
+                        <?php if (!$user['is_owner']): ?>
+                            <details><summary>Yetkileri değiştir</summary><form method="post" class="stack permission-form">
+                                <?php echo csrfField(); ?><input type="hidden" name="action" value="update_user"><input type="hidden" name="user_id" value="<?php echo (int)$user['id']; ?>">
+                                <label class="check"><input type="checkbox" name="can_manage_users" <?php echo $user['can_manage_users'] ? 'checked' : ''; ?>> Hesap yönetimi</label>
+                                <label class="check"><input type="checkbox" name="can_upload" <?php echo $user['can_upload'] ? 'checked' : ''; ?>> Yükleme</label>
+                                <label class="check"><input type="checkbox" name="can_edit" <?php echo $user['can_edit'] ? 'checked' : ''; ?>> Düzenleme</label>
+                                <label class="check"><input type="checkbox" name="can_delete" <?php echo $user['can_delete'] ? 'checked' : ''; ?>> Silme</label>
+                                <button class="button small">Yetkileri kaydet</button>
+                            </form></details>
+                            <form method="post" data-confirm="Bu kullanıcı hesabı silinsin mi?"><?php echo csrfField(); ?><input type="hidden" name="action" value="delete_user"><input type="hidden" name="user_id" value="<?php echo (int)$user['id']; ?>"><button class="button small danger">Hesabı sil</button></form>
+                        <?php endif; ?>
                     </td></tr><?php endforeach; ?>
                 </tbody></table></div>
             </section>
